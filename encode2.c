@@ -6,8 +6,15 @@
 #include <fadec-enc2.h>
 
 
-#define LIKELY(x) __builtin_expect((x), 1)
-#define UNLIKELY(x) __builtin_expect((x), 0)
+#ifdef __GNUC__
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define HINT_COLD __attribute__((cold))
+#else
+#define LIKELY(x) (x)
+#define UNLIKELY(x) (x)
+#define HINT_COLD
+#endif
 
 #define op_reg_idx(op) (op).idx
 #define op_reg_gph(op) (((op).idx & ~0x3) == 0x24)
@@ -25,99 +32,270 @@ op_imm_n(int64_t imm, unsigned immsz) {
     return false;
 }
 
-static __attribute__((cold)) __attribute__((const)) uint8_t
-enc_seg(int flags) {
-    return (0x65643e362e2600 >> (8 * (flags & FE_SEG_MASK))) & 0xff;
+HINT_COLD static unsigned
+enc_seg67(uint8_t* buf, unsigned flags) {
+    unsigned idx = 0;
+    if (UNLIKELY(flags & FE_SEG_MASK)) {
+        unsigned seg = (0x65643e362e2600 >> (8 * (flags & FE_SEG_MASK))) & 0xff;
+        buf[idx++] = seg;
+    }
+    if (UNLIKELY(flags & FE_ADDR32)) buf[idx++] = 0x67;
+    return idx;
 }
 
-static int
-enc_imm(uint8_t* restrict buf, uint64_t imm, unsigned immsz) {
-    if (!op_imm_n(imm, immsz))
-        return -1;
+static void
+enc_imm(uint8_t* buf, uint64_t imm, unsigned immsz) {
     for (unsigned i = 0; i < immsz; i++)
         *buf++ = imm >> 8 * i;
-    return 0;
 }
 
 static int
-enc_mem_common(uint8_t* restrict buf, unsigned bufidx, FeMem op0, uint64_t op1,
-               unsigned immsz, unsigned sibidx) {
+enc_mem_common(uint8_t* buf, unsigned ripoff, FeMem op0, uint64_t op1,
+               unsigned sibidx, unsigned disp8scale) {
     int mod = 0, reg = op1 & 7, rm;
-    int scale = 0, idx = 4, base = 0;
-    bool withsib = false, mod0off = false;
+    unsigned sib = 0x20;
+    bool withsib = false;
     unsigned dispsz = 0;
     int32_t off = op0.off;
 
     if (sibidx < 8) {
-        idx = sibidx;
         int scalabs = op0.scale;
         if (scalabs & (scalabs - 1))
             return 0;
-        scale = (scalabs & 0xA ? 1 : 0) | (scalabs & 0xC ? 2 : 0);
+        unsigned scale = (scalabs & 0xA ? 1 : 0) | (scalabs & 0xC ? 2 : 0);
+        sib = scale << 6 | sibidx << 3;
         withsib = true;
     }
 
-    if (op0.base.idx == op_reg_idx(FE_NOREG)) {
-        rm = 5;
-        mod0off = true;
-        withsib = true;
-    } else if (op0.base.idx == FE_IP.idx) {
-        if (withsib)
+    if (UNLIKELY(op0.base.idx >= 0x20)) {
+        if (UNLIKELY(op0.base.idx >= op_reg_idx(FE_NOREG))) {
+            *buf++ = (reg << 3) | 4;
+            *buf++ = sib | 5;
+            enc_imm(buf, off, 4);
+            return 6;
+        } else if (LIKELY(op0.base.idx == FE_IP.idx)) {
+            if (withsib)
+                return 0;
+            *buf++ = (reg << 3) | 5;
+            // Adjust offset, caller doesn't know instruction length.
+            enc_imm(buf, off - ripoff - 5, 4);
+            return 5;
+        } else {
             return 0;
-        rm = 5;
-        mod0off = true;
-        // Adjust offset, caller doesn't know instruction length.
-        off -= bufidx + 5 + immsz;
-    } else {
-        rm = op_reg_idx(op0.base) & 7;
-        if (rm == 5)
-            mod = 1;
+        }
     }
 
-    if (off && op_imm_n(off, 1) && !mod0off)
-        mod = 1;
-    else if (off && !mod0off)
-        mod = 2;
+    rm = op_reg_idx(op0.base) & 7;
 
+    if (off) {
+        if (LIKELY(!disp8scale)) {
+            mod = (int8_t) off == off ? 0x40 : 0x80;
+            dispsz = (int8_t) off == off ? 1 : 4;
+        } else {
+            if (!(off & ((1 << disp8scale) - 1)) && op_imm_n(off >> disp8scale, 1))
+                off >>= disp8scale, mod = 0x40, dispsz = 1;
+            else
+                mod = 0x80, dispsz = 4;
+        }
+    } else if (rm == 5) {
+        dispsz = 1;
+        mod = 0x40;
+    }
+
+    // Always write four bytes of displacement. The buffer is always large
+    // enough, and we truncate by returning a smaller "written bytes" count.
     if (withsib || rm == 4) {
-        base = rm;
-        rm = 4;
+        *buf++ = mod | (reg << 3) | 4;
+        *buf++ = sib | rm;
+        enc_imm(buf, off, 4);
+        return 2 + dispsz;
+    } else {
+        *buf++ = mod | (reg << 3) | rm;
+        enc_imm(buf, off, 4);
+        return 1 + dispsz;
     }
-
-    dispsz = mod == 1 ? 1 : (mod == 2 || mod0off) ? 4 : 0;
-    if (bufidx + 1 + (mod != 3 && rm == 4) + dispsz + immsz > 15)
-        return 0;
-
-    buf[bufidx++] = (mod << 6) | (reg << 3) | rm;
-    if (mod != 3 && rm == 4)
-        buf[bufidx++] = (scale << 6) | (idx << 3) | base;
-    if (enc_imm(buf + bufidx, off, dispsz))
-        return 0;
-    return 1 + (mod != 3 && rm == 4) + dispsz;
 }
 
 static int
-enc_mem(uint8_t* restrict buf, unsigned bufidx, FeMem op0, uint64_t op1,
-        unsigned immsz, unsigned forcesib) {
-    if ((op_reg_idx(op0.idx) != op_reg_idx(FE_NOREG)) != !!op0.scale)
-        return 0;
+enc_mem(uint8_t* buf, unsigned ripoff, FeMem op0, uint64_t op1, bool forcesib,
+        unsigned disp8scale) {
     unsigned sibidx = forcesib ? 4 : 8;
-    if (op_reg_idx(op0.idx) != op_reg_idx(FE_NOREG)) {
+    if (op_reg_idx(op0.idx) < op_reg_idx(FE_NOREG)) {
+        if (!op0.scale)
+            return 0;
         if (op_reg_idx(op0.idx) == 4)
             return 0;
         sibidx = op_reg_idx(op0.idx) & 7;
+    } else if (op0.scale) {
+        return 0;
     }
-    return enc_mem_common(buf, bufidx, op0, op1, immsz, sibidx);
+    return enc_mem_common(buf, ripoff, op0, op1, sibidx, disp8scale);
 }
 
 static int
-enc_mem_vsib(uint8_t* restrict buf, unsigned bufidx, FeMemV op0, uint64_t op1,
-             unsigned immsz, unsigned forcesib) {
+enc_mem_vsib(uint8_t* buf, unsigned ripoff, FeMemV op0, uint64_t op1,
+             bool forcesib, unsigned disp8scale) {
     (void) forcesib;
     if (!op0.scale)
         return 0;
     FeMem mem = FE_MEM(op0.base, op0.scale, FE_NOREG, op0.off);
-    return enc_mem_common(buf, bufidx, mem, op1, immsz, op_reg_idx(op0.idx) & 7);
+    return enc_mem_common(buf, ripoff, mem, op1, op_reg_idx(op0.idx) & 7,
+                          disp8scale);
+}
+
+// EVEX/VEX "Opcode" format:
+//
+// | EVEX byte 4 | P P M M M - - W | Opcode byte | VEX-D VEX-D-FLIPW
+// 0             8                 16            24
+
+enum {
+    FE_OPC_VEX_WPP_SHIFT = 8,
+    FE_OPC_VEX_WPP_MASK = 0x83 << FE_OPC_VEX_WPP_SHIFT,
+    FE_OPC_VEX_MMM_SHIFT = 10,
+    FE_OPC_VEX_MMM_MASK = 0x1f << FE_OPC_VEX_MMM_SHIFT,
+    FE_OPC_VEX_DOWNGRADE_VEX = 1 << 24,
+    FE_OPC_VEX_DOWNGRADE_VEX_FLIPW = 1 << 25,
+};
+
+static int
+enc_vex_common(uint8_t* buf, unsigned opcode, unsigned base,
+               unsigned idx, unsigned reg, unsigned vvvv) {
+    if ((base | idx | reg | vvvv) & 0x10) return 0;
+    bool vex3 = ((base | idx) & 0x08) || (opcode & 0xfc00) != 0x0400;
+    if (vex3) {
+        *buf++ = 0xc4;
+        unsigned b1 = (opcode & FE_OPC_VEX_MMM_MASK) >> FE_OPC_VEX_MMM_SHIFT;
+        if (!(reg & 0x08)) b1 |= 0x80;
+        if (!(idx & 0x08)) b1 |= 0x40;
+        if (!(base & 0x08)) b1 |= 0x20;
+        *buf++ = b1;
+        unsigned b2 = (opcode & FE_OPC_VEX_WPP_MASK) >> FE_OPC_VEX_WPP_SHIFT;
+        if (opcode & 0x20) b2 |= 0x04;
+        b2 |= (vvvv ^ 0xf) << 3;
+        *buf++ = b2;
+    } else {
+        *buf++ = 0xc5;
+        unsigned b2 = opcode >> FE_OPC_VEX_WPP_SHIFT & 3;
+        if (opcode & 0x20) b2 |= 0x04;
+        if (!(reg & 0x08)) b2 |= 0x80;
+        b2 |= (vvvv ^ 0xf) << 3;
+        *buf++ = b2;
+    }
+    *buf++ = (opcode & 0xff0000) >> 16;
+    return 3 + vex3;
+}
+
+static int
+enc_vex_reg(uint8_t* buf, unsigned opcode, uint64_t rm, uint64_t reg,
+            uint64_t vvvv) {
+    unsigned off = enc_vex_common(buf, opcode, rm, 0, reg, vvvv);
+    buf[off] = 0xc0 | (reg << 3 & 0x38) | (rm & 7);
+    return off ? off + 1 : 0;
+}
+
+static int
+enc_vex_mem(uint8_t* buf, unsigned opcode, FeMem rm, uint64_t reg,
+            uint64_t vvvv, unsigned ripoff, bool forcesib, unsigned disp8scale) {
+    unsigned off = enc_vex_common(buf, opcode, op_reg_idx(rm.base), op_reg_idx(rm.idx), reg, vvvv);
+    unsigned memoff = enc_mem(buf + off, ripoff + off, rm, reg, forcesib, disp8scale);
+    return off && memoff ? off + memoff : 0;
+}
+
+static int
+enc_vex_vsib(uint8_t* buf, unsigned opcode, FeMemV rm, uint64_t reg,
+             uint64_t vvvv, unsigned ripoff, bool forcesib, unsigned disp8scale) {
+    unsigned off = enc_vex_common(buf, opcode, op_reg_idx(rm.base), op_reg_idx(rm.idx), reg, vvvv);
+    unsigned memoff = enc_mem_vsib(buf + off, ripoff + off, rm, reg, forcesib, disp8scale);
+    return off && memoff ? off + memoff : 0;
+}
+
+static int
+enc_evex_common(uint8_t* buf, unsigned opcode, unsigned base,
+                unsigned idx, unsigned reg, unsigned vvvv) {
+    *buf++ = 0x62;
+    bool evexr3 = reg & 0x08;
+    bool evexr4 = reg & 0x10;
+    bool evexb3 = base & 0x08;
+    bool evexb4 = base & 0x10; // evexb4 is unused in AVX-512 encoding
+    bool evexx3 = idx & 0x08;
+    bool evexx4 = idx & 0x10;
+    bool evexv4 = vvvv & 0x10;
+    unsigned b1 = (opcode & FE_OPC_VEX_MMM_MASK) >> FE_OPC_VEX_MMM_SHIFT;
+    if (!evexr3) b1 |= 0x80;
+    if (!evexx3) b1 |= 0x40;
+    if (!evexb3) b1 |= 0x20;
+    if (!evexr4) b1 |= 0x10;
+    if (evexb4) b1 |= 0x08;
+    *buf++ = b1;
+    unsigned b2 = (opcode & FE_OPC_VEX_WPP_MASK) >> FE_OPC_VEX_WPP_SHIFT;
+    if (!evexx4) b2 |= 0x04;
+    b2 |= (~vvvv & 0xf) << 3;
+    *buf++ = b2;
+    unsigned b3 = opcode & 0xff;
+    if (!evexv4) b3 |= 0x08;
+    *buf++ = b3;
+    *buf++ = (opcode & 0xff0000) >> 16;
+    return 5;
+}
+
+static unsigned
+enc_evex_to_vex(unsigned opcode) {
+    return opcode & FE_OPC_VEX_DOWNGRADE_VEX_FLIPW ? opcode ^ 0x8000 : opcode;
+}
+
+// Encode AVX-512 EVEX r/m-reg, non-xmm reg, vvvv, prefer vex
+static int
+enc_evex_reg(uint8_t* buf, unsigned opcode, unsigned rm,
+             unsigned reg, unsigned vvvv) {
+    unsigned off;
+    if (!((rm | reg | vvvv) & 0x10) && (opcode & FE_OPC_VEX_DOWNGRADE_VEX))
+        off = enc_vex_common(buf, enc_evex_to_vex(opcode), rm, 0, reg, vvvv);
+    else
+        off = enc_evex_common(buf, opcode, rm, 0, reg, vvvv);
+    buf[off] = 0xc0 | (reg << 3 & 0x38) | (rm & 7);
+    return off + 1;
+}
+
+// Encode AVX-512 EVEX r/m-reg, xmm reg, vvvv, prefer vex
+static int
+enc_evex_xmm(uint8_t* buf, unsigned opcode, unsigned rm,
+             unsigned reg, unsigned vvvv) {
+    unsigned off;
+    if (!((rm | reg | vvvv) & 0x10) && (opcode & FE_OPC_VEX_DOWNGRADE_VEX))
+        off = enc_vex_common(buf, enc_evex_to_vex(opcode), rm, 0, reg, vvvv);
+    else
+        // AVX-512 XMM reg encoding uses X3 instead of B4.
+        off = enc_evex_common(buf, opcode, rm & 0x0f, rm >> 1, reg, vvvv);
+    buf[off] = 0xc0 | (reg << 3 & 0x38) | (rm & 7);
+    return off + 1;
+}
+
+static int
+enc_evex_mem(uint8_t* buf, unsigned opcode, FeMem rm, uint64_t reg,
+             uint64_t vvvv, unsigned ripoff, bool forcesib, unsigned disp8scale) {
+    unsigned off;
+    if (!((op_reg_idx(rm.base) | op_reg_idx(rm.idx) | reg | vvvv) & 0x10) &&
+        (opcode & FE_OPC_VEX_DOWNGRADE_VEX)) {
+        disp8scale = 0; // Only AVX-512 EVEX compresses displacement
+        off = enc_vex_common(buf, enc_evex_to_vex(opcode), op_reg_idx(rm.base), op_reg_idx(rm.idx), reg, vvvv);
+    } else {
+        off = enc_evex_common(buf, opcode, op_reg_idx(rm.base), op_reg_idx(rm.idx), reg, vvvv);
+    }
+    unsigned memoff = enc_mem(buf + off, ripoff + off, rm, reg, forcesib, disp8scale);
+    return off && memoff ? off + memoff : 0;
+}
+
+static int
+enc_evex_vsib(uint8_t* buf, unsigned opcode, FeMemV rm, uint64_t reg,
+             uint64_t vvvv, unsigned ripoff, bool forcesib, unsigned disp8scale) {
+    (void) vvvv;
+    // EVEX VSIB requires non-zero mask operand
+    if (!(opcode & 0x7)) return 0;
+    // EVEX.X4 is encoded in EVEX.V4
+    unsigned idx = op_reg_idx(rm.idx);
+    unsigned off = enc_evex_common(buf, opcode, op_reg_idx(rm.base), idx & 0x0f, reg, idx & 0x10);
+    unsigned memoff = enc_mem_vsib(buf + off, ripoff + off, rm, reg, forcesib, disp8scale);
+    return off && memoff ? off + memoff : 0;
 }
 
 unsigned fe64_NOP(uint8_t* buf, unsigned flags) {

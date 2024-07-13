@@ -10,6 +10,8 @@ if not py_version.version_compare('>=3.6')
   error('Python 3.6 required, got @0@'.format(py_version))
 endif
 
+has_cpp = add_languages('cpp', required: false)
+
 cc = meson.get_compiler('c')
 if cc.has_argument('-fstrict-aliasing')
   add_project_arguments('-fstrict-aliasing', language: 'c')
@@ -24,11 +26,29 @@ if get_option('warning_level').to_int() >= 3
     # always warns, even on architectures without alignment requirements.
     '-Wcast-align', '-Wcast-align=strict',
   ]
-  foreach warning : extra_warnings
-    if cc.has_argument(warning)
-      add_project_arguments(warning, language: 'c')
-    endif
-  endforeach
+  add_project_arguments(cc.get_supported_arguments(extra_warnings), language: 'c')
+endif
+if cc.get_argument_syntax() == 'msvc'
+  # Disable some warnings to align warnings with GCC and Clang:
+  add_project_arguments('-D_CRT_SECURE_NO_WARNINGS',
+                        '/wd4018', # - Signed/unsigned comparison
+                        '/wd4146', # - Unary minus operator applied to unsigned
+                                   #   type, result still unsigned
+                        '/wd4244', # - Possible loss of data in conversion
+                                   #   from integer type to smaller integer type
+                        '/wd4245', # - Signed/unsigned assignment
+                        '/wd4267', # - Possible loss of data in conversion
+                                   #   from size_t to smaller type
+                        '/wd4310', # - Possible loss of data in conversion
+                                   #   of constant value to smaller type
+                        language: 'c')
+endif
+if cc.get_id() == 'msvc' and has_cpp
+  cxx = meson.get_compiler('cpp')
+  if cxx.get_id() == 'msvc'
+    # Enable standard conformant preprocessor
+    add_project_arguments(cxx.get_supported_arguments(['-Zc:preprocessor']), language: 'cpp')
+  endif
 endif
 
 sources = []
@@ -49,22 +69,6 @@ if get_option('with_encode2')
   components += 'encode2'
   headers += files('fadec-enc2.h')
   sources += files('encode2.c')
-endif
-
-if cc.get_argument_syntax() == 'msvc'
-  # Disable some warnings to align warnings with GCC and Clang:
-  add_project_arguments('-D_CRT_SECURE_NO_WARNINGS',
-                        '/wd4018', # - Signed/unsigned comparison
-                        '/wd4146', # - Unary minus operator applied to unsigned
-                                   #   type, result still unsigned
-                        '/wd4244', # - Possible loss of data in conversion
-                                   #   from integer type to smaller integer type
-                        '/wd4245', # - Signed/unsigned assignment
-                        '/wd4267', # - Possible loss of data in conversion
-                                   #   from size_t to smaller type
-                        '/wd4310', # - Possible loss of data in conversion
-                                   #   of constant value to smaller type
-                        language: 'c')
 endif
 
 generate_args = []
@@ -103,6 +107,11 @@ foreach component : components
   test(component, executable('@0@-test'.format(component),
                              '@0@-test.c'.format(component),
                              dependencies: fadec))
+  if component == 'encode2' and has_cpp
+    test(component + '-cpp', executable('@0@-test-cpp'.format(component),
+                                        '@0@-test.cc'.format(component),
+                                        dependencies: fadec))
+  endif
 endforeach
 
 if meson.version().version_compare('>=0.54.0')

@@ -1,10 +1,112 @@
-# Opcode              ENC  OP1 OP2 OP3 OP4 MNEM       COND SZ? MISC FLAGS
-#                                                     LOCK SZ8 = op size 1
-#                                                      I64 D64 = default 64
-#                                                      O64 F64 = force 64 (Intel)
-#                                                     VSIB U66 = respect 66 prefix
-#                                                          I66 = ignore 66 prefix
-# ------------------- ---- --- --- --- --- -------    ---- --- ----------
+# Fadec Instruction Description Table
+#
+# This file table contains all supported instructions. The format is custom,
+# this parsed and processed into decode tables/encoders in parseinstrs.py.
+#
+#
+# The opcode is used to determine the instruction row when decoding from
+# instruction bytes. There are multiple components up to the opcode byte:
+#
+#   (VEX\.|EVEX\.)? -> VEX/EVEX prefix; or legacy if absent
+#   ((NP|66|F2|F3|NFx)\.)? -> optional mandatory prefix
+#   (W[01]\.)? -> W0/W1, ignored if absent
+#   (L(0|1|12|IG)\.)? -> VEX.L/EVEX.L'L constraint, must not occur for legacy
+#       opcodes; not really used for distinguishing instructions/encodings
+#       (exceptions: VZEROUPPER/VZEROALL and VMOVDDUP)
+#   (|0f|0f38|0f3a|M[56]\.) -> legacy escape; or VEX/EVEX opcode map
+#   [0-9a-f]{2} -> actual opcode byte
+#
+# After the opcode byte, at most one of the following specifiers can follow:
+#
+#   /[rm] -> ModRM.mod specifier (register or memory operand only)
+#   /[0-7] -> ModRM.reg specifier (used as opcode extension)
+#   /[0-7][rm] -> ModRM.mod and ModRM.reg specifier
+#   /[rm][0-7] -> ModRM.mod and ModRM.r/m specifier (AMX only)
+#   [c-f][0-9a-f] -> complete ModRM specifier, whole byte used as opcode ext.
+#   + -> for O-encoded instructions, the last three bits are an operand
+#
+# A legacy opcode may be prefixed with "*", making it a weak opcode which can be
+# overwritten by later opcode definitions. This is used for reserved nops,
+# reserved prefetch, BSF/BSR (overwritten by TZCNT/LZCNT), and WBINVD
+# (overwritten by WBNOINVD).
+#
+# The encoding description follows the naming found in older (pre-AVX-512) Intel
+# SDMs. It maps encoding fields to operand indices and specifies the immediate
+# encoding. The gist is: M=ModRM.r/m; R=ModRM.reg; V=VEX.vvvv; A=EAX/XMM0; C=CL;
+# I=imm; O=opcode bits 5:7; S=opcode bits 2:4; FD/TD=absolute address; D=jump
+# destination. RVMR is an exception, the register is encoded in imm8[7:4].
+# MOV_CR/MOV_DR are another exception, they ignore ModRM.mod and always encode a
+# register operand.
+#
+# For operands, the first letter specified the operand kind. Naming is mostly
+# consistent with Intel's SDM, except for F (Intel: eflags; here: FPU).
+#
+#                   GP  MMX XMM MSK TMM FPU CR  DR  SEG
+#   ModRM.r/m (reg) R   N   U   K   T   F   -   -   -
+#   ModRM.r/m (r/m) E   Q   W   K   T   -   -   -   -
+#   ModRM.reg       G   P   V   K   T   F   C   D   S
+#   VEX.vvvv        B   -   H   K   T   -   -   -   -
+#   imm8[7:4]       -   -   L   -   -   -   -   -   -
+#
+#   M=memory only; O=direct address
+#   I=immediate; A=address/far jmp; J=rip-relative address/jmp
+#
+# The remaining one or two letters specify the operand size:
+#
+# - Fixed sizes: b=1; w=2, d/ss=4; q/sd=8; dq=16; qq=32; oq=64
+# - GP operand sizes: v=2/4/8 (66/REX.W); y=4/8 (66 ignored)
+# - Vector sizes: x/ps/pd=16/32/64 (EVEX.L'L); h=half x, f=fourth x; e=eighth x
+# - Other immediate sizes: z=v with max. 4 bytes; bs=v (sign-extended byte);
+#   zd=z (but always four byte imm); zq=z (but always eight byte imm)
+# - Special operand size: a=z:z (BOUND only); p=w:z (far pointer)
+# - If not letter is specified, the operand size is decoded as zero. The size
+#   is implicitly part of the operand and can be reconstructed by the user.
+#
+# The instruction mnemonic is generally specified as decoded/formatted (there
+# are a few exceptions, see parseinstrs.py decode_table and encode_mnems).
+#
+# After the mnemonic, flags can be specified. Some common flags have a short
+# form immediately after the mnemonic (e.g., EVX_ADDSD+kr), others do not.
+#
+# - I64: invalid in 64-bit mode
+# - O64: only valid in 64-bit mode
+# - +w (INSTR_WIDTH): store operand size as instruction attribute; used for
+#   instructions that depend on the operand size but have no explicit operands.
+# - +a (U67): respects addr-size override even without memory operand.
+# - +s (USEG): respects segment override even without memory operand.
+# - +k (MASK): supports EVEX masking.
+# - +e (SAE): supports EVEX suppress all exceptions.
+# - +r (ER): supports EVEX embedded rounding control.
+# - +b (BCST): supports EVEX embedded broadcast. Broadcast size depends on REX.W
+#   (REX.W=0 => 32 bits; REX.W=1 => 64 bits).
+# - BCST16: set EVEX embedded broadcast size to 16 bits.
+# - SZ8: has effective operand size of 8 bits (encode only).
+# - U66: uses 66 prefix as operand size override even with a mandatory prefix.
+# - I66: ignores 66 prefix as operand size override.
+# - LOCK: supports LOCK prefix when the first operand is memory.
+# - D64: defaults to 64-bit operand size in 64-bit mode (REX.W ignored).
+# - F64: forced to 64-bit operand size in 64-bit mode (66/REX.W ignored).
+#   NB: this is Intel-specific. On AMD, F64 behaves like D64.
+# - VSIB: memory operand uses VSIB encoding (SIB required, idx is vector).
+# - ENC_SEPSZ: attach size suffixes to each operand (encode only).
+# - ENC_NOSZ: do not attach size suffix (encode only).
+# - ENC_REP: supports REP prefix.
+# - ENC_REPCC: supports REPZ/REPNZ prefix.
+# - UNDOC: undocumented, ignored by default.
+# - TUPLE_*: AVX-512 tuple size. Only used to verify operand sizes.
+# - CPL0: only valid if CPL=0 (system mode). Annotation only.
+# - F=<feature flags>: feature flags. Annotation only.
+# - EFL=<flags>: status flags use/modifications. Order: OF/DF/IF/SF/ZF/AF/PF/CF.
+#   t=test; m=modify; 0=clear; 1=set; M=test-and-modify; u=undefined
+#
+#
+# Opcode               ENC  OP1 OP2 OP3 OP4 MNEM       COND SZ? MISC FLAGS
+#                                                      LOCK SZ8
+#                                                       I64 D64
+#                                                       O64 F64
+#                                                      VSIB U66
+#                                                           I66
+# -------------------  ---- --- --- --- --- -------    ---- --- ----------
 00                     MR   Eb  Gb  -   -   ADD        LOCK SZ8 EFL=m--mmmmm
 01                     MR   Ev  Gv  -   -   ADD        LOCK     EFL=m--mmmmm
 02                     RM   Gb  Eb  -   -   ADD             SZ8 EFL=m--mmmmm
@@ -86,8 +188,8 @@
 69                     RMI  Gv  Ev  Iz  -   IMUL                EFL=m--uuuum
 6a                     I    Ibs -   -   -   PUSH            D64
 6b                     RMI  Gv  Ev  Ibs -   IMUL                EFL=m--uuuum
-6c                     NP   -   -   -   -   INS+ws          SZ8 ENC_REP EFL=-t------
-6d                     NP   -   -   -   -   INS+ws              ENC_REP EFL=-t------
+6c                     NP   -   -   -   -   INS+wa          SZ8 ENC_REP EFL=-t------
+6d                     NP   -   -   -   -   INS+wa              ENC_REP EFL=-t------
 6e                     NP   -   -   -   -   OUTS+was        SZ8 ENC_REP EFL=-t------
 6f                     NP   -   -   -   -   OUTS+was            ENC_REP EFL=-t------
 70                     D    Jbs -   -   -   JO              F64 EFL=t-------
@@ -358,7 +460,7 @@ NP.0f01d7              NP   -   -   -   -   ENCLU               F=SGX
 0f0d/2m                M    Mb  -   -   -   PREFETCHWT1         F=PREFETCHWT1
 # All other slots are reserved, AMD maps them to /0
 *0f0d/m                M    Mb  -   -   -   RESERVED_PREFETCH   ONLYAMD F=PREFETCH
-*0f0d/r                MR   Ev  Gv  -   -   RESERVED_NOP
+*0f0d/r                MR   Rv  Gv  -   -   RESERVED_NOP
 0f0e                   NP   -   -   -   -   FEMMS               ONLYAMD F=3DNOW
 # TODO: actually decode 3DNow! instructions. Given that 3DNow! no longer exists,
 # this is unlikely to happen, though.
@@ -507,7 +609,7 @@ NP.0f6b                RM   Pq  Qq  -   -   MMX_PACKSSDW        F=MMX
 NP.W0.0f6e             RM   Pq  Ey  -   -   MMX_MOVD_G2M        F=MMX ENC_NOSZ
 NP.W1.0f6e             RM   Pq  Ey  -   -   MMX_MOVQ_G2M        F=MMX ENC_NOSZ
 NP.0f6f                RM   Pq  Qq  -   -   MMX_MOVQ            F=MMX
-NP.0f70                RMI  Qq  Pq  Ib  -   MMX_PSHUFW          F=SSE
+NP.0f70                RMI  Pq  Qq  Ib  -   MMX_PSHUFW          F=SSE
 NP.0f71/2r             MI   Nq  Ib  -   -   MMX_PSRLW           F=MMX
 NP.0f71/4r             MI   Nq  Ib  -   -   MMX_PSRAW           F=MMX
 NP.0f71/6r             MI   Nq  Ib  -   -   MMX_PSLLW           F=MMX
@@ -608,16 +710,16 @@ NP.0f14                RM   Vps Wps -   -   SSE_UNPCKLPS        F=SSE
 66.0f14                RM   Vpd Wpd -   -   SSE_UNPCKLPD        F=SSE2
 NP.0f15                RM   Vps Wps -   -   SSE_UNPCKHPS        F=SSE
 66.0f15                RM   Vpd Wpd -   -   SSE_UNPCKHPD        F=SSE2
-NP.0f16/m              RM   Vx  Wq  -   -   SSE_MOVHPS          F=SSE
-NP.0f16/r              RM   Vx  Wq  -   -   SSE_MOVLHPS         F=SSE
+NP.0f16/m              RM   Vx  Mq  -   -   SSE_MOVHPS          F=SSE
+NP.0f16/r              RM   Vx  Uq  -   -   SSE_MOVLHPS         F=SSE
 66.0f16/m              RM   Vdq Mq  -   -   SSE_MOVHPD          F=SSE2
 F3.0f16                RM   Vx  Wx  -   -   SSE_MOVSHDUP        F=SSE3
 NP.0f17/m              MR   Mq  Vx  -   -   SSE_MOVHPS          F=SSE
 66.0f17/m              MR   Mq  Vx  -   -   SSE_MOVHPD          F=SSE2
 NP.0f28                RM   Vps Wps -   -   SSE_MOVAPS          F=SSE
 66.0f28                RM   Vpd Wpd -   -   SSE_MOVAPD          F=SSE2
-NP.0f29                MR   Vps Wps -   -   SSE_MOVAPS          F=SSE
-66.0f29                MR   Vpd Wpd -   -   SSE_MOVAPD          F=SSE2
+NP.0f29                MR   Wps Vps -   -   SSE_MOVAPS          F=SSE
+66.0f29                MR   Wpd Vpd -   -   SSE_MOVAPD          F=SSE2
 F3.0f2a                RM   Vss Ey  -   -   SSE_CVTSI2SS        F=SSE
 F2.0f2a                RM   Vsd Ey  -   -   SSE_CVTSI2SD        F=SSE2
 NP.0f2b/m              MR   Mps Vps -   -   SSE_MOVNTPS         F=SSE
@@ -660,8 +762,8 @@ F3.0f59                RM   Vss Wss -   -   SSE_MULSS           F=SSE
 F2.0f59                RM   Vsd Wsd -   -   SSE_MULSD           F=SSE2
 NP.0f5a                RM   Vpd Wq  -   -   SSE_CVTPS2PD        F=SSE2
 66.0f5a                RM   Vps Wpd -   -   SSE_CVTPD2PS        F=SSE2
-F3.0f5a                RM   Vsd Vss -   -   SSE_CVTSS2SD        F=SSE2
-F2.0f5a                RM   Vss Vsd -   -   SSE_CVTSD2SS        F=SSE2
+F3.0f5a                RM   Vsd Wss -   -   SSE_CVTSS2SD        F=SSE2
+F2.0f5a                RM   Vss Wsd -   -   SSE_CVTSD2SS        F=SSE2
 NP.0f5b                RM   Vps Wdq -   -   SSE_CVTDQ2PS        F=SSE2
 66.0f5b                RM   Vdq Wps -   -   SSE_CVTPS2DQ        F=SSE2
 F3.0f5b                RM   Vdq Wps -   -   SSE_CVTTPS2DQ       F=SSE2
@@ -717,9 +819,9 @@ F2.0f70                RMI  Vx  Wx  Ib  -   SSE_PSHUFLW         F=SSE2
 66.0f76                RM   Vx  Wx  -   -   SSE_PCMPEQD         F=SSE2
 # EXTRQ/INSERTQ immediate size handled in code.
 66.0f78/0r             MI   Ux  Iw  -   -   SSE_EXTRQ           F=SSE4A ONLYAMD
-F2.0f78/r              RMI  Vx  Wx  Iw  -   SSE_INSERTQ         F=SSE4A ONLYAMD
-66.0f79/r              RM   Vx  Wx  -   -   SSE_EXTRQ           F=SSE4A ONLYAMD
-F2.0f79/r              RM   Vx  Wx  -   -   SSE_INSERTQ         F=SSE4A ONLYAMD
+F2.0f78/r              RMI  Vx  Ux  Iw  -   SSE_INSERTQ         F=SSE4A ONLYAMD
+66.0f79/r              RM   Vx  Ux  -   -   SSE_EXTRQ           F=SSE4A ONLYAMD
+F2.0f79/r              RM   Vx  Ux  -   -   SSE_INSERTQ         F=SSE4A ONLYAMD
 66.0f7c                RM   Vx  Wx  -   -   SSE_HADDPD          F=SSE3
 F2.0f7c                RM   Vx  Wx  -   -   SSE_HADDPS          F=SSE3
 66.0f7d                RM   Vx  Wx  -   -   SSE_HSUBPD          F=SSE3
@@ -809,8 +911,8 @@ F2.0ff0/m              RM   Vx  Mx  -   -   SSE_LDDQU           F=SSE3
 66.0f380a              RM   Vx  Wx  -   -   SSE_PSIGND          F=SSSE3
 66.0f380b              RM   Vx  Wx  -   -   SSE_PMULHRSW        F=SSSE3
 66.0f3810              RM   Vdq Wdq -   -   SSE_PBLENDVB        F=SSE41
-66.0f3814              RMA  Vdq Wdq Udq -   SSE_BLENDVPS        F=SSE41
-66.0f3815              RMA  Vdq Wdq Udq -   SSE_BLENDVPD        F=SSE41
+66.0f3814              RMA  Vdq Wdq Hdq -   SSE_BLENDVPS        F=SSE41
+66.0f3815              RMA  Vdq Wdq Hdq -   SSE_BLENDVPD        F=SSE41
 66.0f3817              RM   Vx  Wx  -   -   SSE_PTEST           F=SSE41 EFL=0--0m00m
 66.0f381c              RM   Vx  Wx  -   -   SSE_PABSB           F=SSSE3
 66.0f381d              RM   Vx  Wx  -   -   SSE_PABSW           F=SSSE3
@@ -965,9 +1067,9 @@ VEX.NP.0f5a            RM   Vpd Wh  -   -   VCVTPS2PD           F=AVX
 VEX.66.0f5a            RM   Vh  Wpd -   -   VCVTPD2PS           F=AVX
 VEX.F3.LIG.0f5a        RVM  Vdq Hdq Wss -   VCVTSS2SD           F=AVX
 VEX.F2.LIG.0f5a        RVM  Vdq Hdq Wsd -   VCVTSD2SS           F=AVX
-VEX.NP.0f5b            RM   Vps Vx  -   -   VCVTDQ2PS           F=AVX
-VEX.66.0f5b            RM   Vx  Vps -   -   VCVTPS2DQ           F=AVX
-VEX.F3.0f5b            RM   Vx  Vps -   -   VCVTTPS2DQ          F=AVX
+VEX.NP.0f5b            RM   Vps Wx  -   -   VCVTDQ2PS           F=AVX
+VEX.66.0f5b            RM   Vx  Wps -   -   VCVTPS2DQ           F=AVX
+VEX.F3.0f5b            RM   Vx  Wps -   -   VCVTTPS2DQ          F=AVX
 VEX.NP.0f5c            RVM  Vps Hps Wps -   VSUBPS              F=AVX
 VEX.66.0f5c            RVM  Vpd Hpd Wpd -   VSUBPD              F=AVX
 VEX.F3.LIG.0f5c        RVM  Vdq Hdq Wss -   VSUBSS              F=AVX
@@ -1028,7 +1130,7 @@ VEX.F2.0f7d            RVM  Vx  Hx  Wx  -   VHSUBPS             F=AVX
 VEX.66.W0.L0.0f7e      MR   Ey  Vy  -   -   VMOVD_X2G           F=AVX ENC_NOSZ
 VEX.66.W1.L0.0f7e      MR   Ey  Vy  -   -   VMOVD_X2G   I64     F=AVX ENC_NOSZ
 VEX.66.W1.L0.0f7e      MR   Ey  Vy  -   -   VMOVQ_X2G   O64     F=AVX ENC_NOSZ
-VEX.F3.L0.0f7e         RM   Vq  Wq  -   -   VMOVQ               F=AVX ENC_NOSZ
+VEX.F3.L0.0f7e         RM   Vq  Wq  -   -   VMOVQ               F=AVX
 VEX.66.0f7f            MR   Wx  Vx  -   -   VMOVDQA             F=AVX
 VEX.F3.0f7f            MR   Wx  Vx  -   -   VMOVDQU             F=AVX
 VEX.NP.L0.0fae/2m      M    Md  -   -   -   VLDMXCSR            F=AVX
@@ -1037,8 +1139,8 @@ VEX.NP.0fc2            RVMI Vx  Hx  Wx  Ib  VCMPPS              F=AVX
 VEX.66.0fc2            RVMI Vx  Hx  Wx  Ib  VCMPPD              F=AVX
 VEX.F3.LIG.0fc2        RVMI Vdq Hdq Wss Ib  VCMPSS              F=AVX
 VEX.F2.LIG.0fc2        RVMI Vdq Hdq Wsd Ib  VCMPSD              F=AVX
-VEX.66.L0.0fc4         RVMI Vx  Hx  Ew  Ib  VPINSRW             F=AVX ENC_NOSZ
-VEX.66.L0.0fc5/r       RMI  Gd  Ux  Ib  -   VPEXTRW             F=AVX ENC_NOSZ
+VEX.66.L0.0fc4         RVMI Vdq Hdq Ew  Ib  VPINSRW             F=AVX
+VEX.66.L0.0fc5/r       RMI  Gd  Udq Ib  -   VPEXTRW             F=AVX
 VEX.NP.0fc6            RVMI Vx  Hx  Wx  Ib  VSHUFPS             F=AVX
 VEX.66.0fc6            RVMI Vx  Hx  Wx  Ib  VSHUFPD             F=AVX
 VEX.66.0fd0            RVM  Vx  Hx  Wx  -   VADDSUBPD           F=AVX
@@ -1076,7 +1178,7 @@ VEX.66.0fea            RVM  Vx  Hx  Wx  -   VPMINSW             F=AVX
 VEX.66.0fed            RVM  Vx  Hx  Wx  -   VPADDSW             F=AVX
 VEX.66.0fee            RVM  Vx  Hx  Wx  -   VPMAXSW             F=AVX
 VEX.66.0fef            RVM  Vx  Hx  Wx  -   VPXOR               F=AVX
-VEX.F2.0ff0/m          RM   Vx  Wx  -   -   VLDDQU              F=AVX
+VEX.F2.0ff0/m          RM   Vx  Mx  -   -   VLDDQU              F=AVX
 VEX.66.0ff1            RVM  Vx  Hx  Wdq -   VPSLLW              F=AVX
 VEX.66.0ff2            RVM  Vx  Hx  Wdq -   VPSLLD              F=AVX
 VEX.66.0ff3            RVM  Vx  Hx  Wdq -   VPSLLQ              F=AVX
@@ -1244,19 +1346,19 @@ VEX.66.0f3a0c          RVMI Vx  Hx  Wx  Ib  VBLENDPS            F=AVX
 VEX.66.0f3a0d          RVMI Vx  Hx  Wx  Ib  VBLENDPD            F=AVX
 VEX.66.0f3a0e          RVMI Vx  Hx  Wx  Ib  VPBLENDW            F=AVX
 VEX.66.0f3a0f          RVMI Vx  Hx  Wx  Ib  VPALIGNR            F=AVX
-VEX.66.L0.0f3a14/m     MRI  Mb  Vx  Ib  -   VPEXTRB             F=AVX ENC_NOSZ
-VEX.66.L0.0f3a14/r     MRI  Rd  Vx  Ib  -   VPEXTRB             F=AVX ENC_NOSZ
-VEX.66.L0.0f3a15/m     MRI  Mw  Vx  Ib  -   VPEXTRW             F=AVX ENC_NOSZ
-VEX.66.L0.0f3a15/r     MRI  Rd  Vx  Ib  -   VPEXTRW             F=AVX ENC_NOSZ
-VEX.66.W0.L0.0f3a16    MRI  Ed  Vx  Ib  -   VPEXTRD             F=AVX ENC_NOSZ
-VEX.66.W1.L0.0f3a16    MRI  Ed  Vx  Ib  -   VPEXTRD     I64     F=AVX ENC_NOSZ
-VEX.66.W1.L0.0f3a16    MRI  Eq  Vx  Ib  -   VPEXTRQ     O64     F=AVX ENC_NOSZ
-VEX.66.L0.0f3a17       MRI  Ed  Vx  Ib  -   VEXTRACTPS          F=AVX ENC_NOSZ
+VEX.66.L0.0f3a14/m     MRI  Mb  Vdq Ib  -   VPEXTRB             F=AVX
+VEX.66.L0.0f3a14/r     MRI  Rd  Vdq Ib  -   VPEXTRB             F=AVX
+VEX.66.L0.0f3a15/m     MRI  Mw  Vdq Ib  -   VPEXTRW             F=AVX
+VEX.66.L0.0f3a15/r     MRI  Rd  Vdq Ib  -   VPEXTRW             F=AVX
+VEX.66.W0.L0.0f3a16    MRI  Ey  Vdq Ib  -   VPEXTRD             F=AVX ENC_NOSZ
+VEX.66.W1.L0.0f3a16    MRI  Ey  Vdq Ib  -   VPEXTRD     I64     F=AVX ENC_NOSZ
+VEX.66.W1.L0.0f3a16    MRI  Ey  Vdq Ib  -   VPEXTRQ     O64     F=AVX ENC_NOSZ
+VEX.66.L0.0f3a17       MRI  Ed  Vdq Ib  -   VEXTRACTPS          F=AVX
 VEX.66.W0.L1.0f3a18    RVMI Vx  Hx  Wdq Ib  VINSERTF128         F=AVX ENC_NOSZ
 VEX.66.W0.L1.0f3a19    MRI  Wdq Vx  Ib  -   VEXTRACTF128        F=AVX ENC_NOSZ
-VEX.66.W0.0f3a1d       MRI  Wh  Hx  Ib  -   VCVTPS2PH           F=F16C
-VEX.66.L0.0f3a20       RVMI Vx  Hx  Eb  Ib  VPINSRB             F=AVX ENC_NOSZ
-VEX.66.L0.0f3a21       RVMI Vx  Hx  Wd  Ib  VINSERTPS           F=AVX ENC_NOSZ
+VEX.66.W0.0f3a1d       MRI  Wh  Vx  Ib  -   VCVTPS2PH           F=F16C
+VEX.66.L0.0f3a20       RVMI Vdq Hdq Eb  Ib  VPINSRB             F=AVX
+VEX.66.L0.0f3a21       RVMI Vdq Hdq Wd  Ib  VINSERTPS           F=AVX
 VEX.66.W0.L0.0f3a22    RVMI Vdq Hdq Ey  Ib  VPINSRD             F=AVX ENC_NOSZ
 VEX.66.W1.L0.0f3a22    RVMI Vdq Hdq Ey  Ib  VPINSRD     I64     F=AVX ENC_NOSZ
 VEX.66.W1.L0.0f3a22    RVMI Vdq Hdq Ey  Ib  VPINSRQ     O64     F=AVX ENC_NOSZ
@@ -1367,8 +1469,8 @@ db/0m                  M    Md  -   -   -   FILD                F=387 ENC_SEPSZ
 db/1m                  M    Md  -   -   -   FISTTP              F=SSE3 ENC_SEPSZ
 db/2m                  M    Md  -   -   -   FIST                F=387 ENC_SEPSZ
 db/3m                  M    Md  -   -   -   FISTP               F=387 ENC_SEPSZ
-db/5m                  M    Ft  -   -   -   FLD                 F=387 ENC_SEPSZ
-db/7m                  M    Ft  -   -   -   FSTP                F=387 ENC_SEPSZ
+db/5m                  M    Mt  -   -   -   FLD                 F=387 ENC_SEPSZ
+db/7m                  M    Mt  -   -   -   FSTP                F=387 ENC_SEPSZ
 db/0r                  M    Ft  -   -   -   FCMOVNB             F=686 EFL=-------t
 db/1r                  M    Ft  -   -   -   FCMOVNE             F=686 EFL=----t---
 db/2r                  M    Ft  -   -   -   FCMOVNBE            F=686 EFL=----t--t
@@ -1430,9 +1532,9 @@ df/0m                  M    Mw  -   -   -   FILD                F=387 ENC_SEPSZ
 df/1m                  M    Mw  -   -   -   FISTTP              F=387 ENC_SEPSZ
 df/2m                  M    Mw  -   -   -   FIST                F=387 ENC_SEPSZ
 df/3m                  M    Mw  -   -   -   FISTP               F=387 ENC_SEPSZ
-df/4m                  M    Ft  -   -   -   FBLD                F=387
+df/4m                  M    Mt  -   -   -   FBLD                F=387
 df/5m                  M    Mq  -   -   -   FILD                F=387 ENC_SEPSZ
-df/6m                  M    Ft  -   -   -   FBSTP               F=387
+df/6m                  M    Mt  -   -   -   FBSTP               F=387
 df/7m                  M    Mq  -   -   -   FISTP               F=387 ENC_SEPSZ
 df/0r                  M    Ft  -   -   -   FFREEP              F=387 UNDOC
 df/1r                  AM   Ft  Ft  -   -   FXCH                F=387 UNDOC
@@ -1572,7 +1674,7 @@ F3.0fc7/7r             M    Ry  -   -   -   RDPID           D64 F=RDPID
 NP.0f38c8              RM   Vdq Wdq -   -   SHA1NEXTE           F=SHA
 NP.0f38c9              RM   Vdq Wdq -   -   SHA1MSG1            F=SHA
 NP.0f38ca              RM   Vdq Wdq -   -   SHA1MSG2            F=SHA
-NP.0f38cb              RMA  Vdq Wdq Udq -   SHA256RNDS2         F=SHA
+NP.0f38cb              RMA  Vdq Wdq Hdq -   SHA256RNDS2         F=SHA
 NP.0f38cc              RM   Vdq Wdq -   -   SHA256MSG1          F=SHA
 NP.0f38cd              RM   Vdq Wdq -   -   SHA256MSG2          F=SHA
 NP.0f3acc              RMI  Vdq Wdq Ib  -   SHA1RNDS4           F=SHA
@@ -1727,7 +1829,7 @@ EVEX.F2.W1.LIG.0f5a    RVM  Vdq Hdq Wsd -   EVX_CVTSD2SS+kr     F=AVX512F TUPLE1
 EVEX.F3.LIG.0f2a       RVM  Vdq Hdq Ey  -   EVX_CVTSI2SS+r      F=AVX512F TUPLE1_SCALAR_OPSZ
 # Note: for W0, ER is ignored (i.e., will not UD, according to Intel SDM)
 EVEX.F2.LIG.0f2a       RVM  Vdq Hdq Ey  -   EVX_CVTSI2SD+r      F=AVX512F TUPLE1_SCALAR_OPSZ
-EVEX.66.W1.0fe6        RM   Vps Wpd -   -   EVX_CVTTPD2DQ+kbe   F=AVX512F TUPLE_FULL_64
+EVEX.66.W1.0fe6        RM   Vh  Wpd -   -   EVX_CVTTPD2DQ+kbe   F=AVX512F TUPLE_FULL_64
 EVEX.F3.W0.0f5b        RM   Vps Wps -   -   EVX_CVTTPS2DQ+kbe   F=AVX512F TUPLE_FULL_32
 EVEX.F2.LIG.0f2c       RM   Gy  Wsd -   -   EVX_CVTTSD2SI+e     F=AVX512F TUPLE1_FIXED_64
 EVEX.F3.LIG.0f2c       RM   Gy  Wss -   -   EVX_CVTTSS2SI+e     F=AVX512F TUPLE1_FIXED_32
@@ -1736,8 +1838,8 @@ EVEX.66.W1.0f5e        RVM  Vpd Hpd Wpd -   EVX_DIVPD+kbr       F=AVX512F TUPLE_
 EVEX.F3.W0.LIG.0f5e    RVM  Vdq Hdq Wss -   EVX_DIVSS+kr        F=AVX512F TUPLE1_SCALAR_32
 EVEX.F2.W1.LIG.0f5e    RVM  Vdq Hdq Wsd -   EVX_DIVSD+kr        F=AVX512F TUPLE1_SCALAR_64
 # Note: tuple size is actually fixed at 32 bits, regardless of EVEX.W
-EVEX.66.L0.0f3a17      MRI  Ess Vps Ib  -   EVX_EXTRACTPS       F=AVX512F TUPLE1_FIXED_32
-EVEX.66.W0.L0.0f3a21   RVMI Vps Hps Wss Ib  EVX_INSERTPS        F=AVX512F TUPLE1_SCALAR_32
+EVEX.66.L0.0f3a17      MRI  Ess Vdq Ib  -   EVX_EXTRACTPS       F=AVX512F TUPLE1_FIXED_32
+EVEX.66.W0.L0.0f3a21   RVMI Vdq Hdq Wss Ib  EVX_INSERTPS        F=AVX512F TUPLE1_SCALAR_32
 EVEX.NP.W0.0f5f        RVM  Vps Hps Wps -   EVX_MAXPS+kbe       F=AVX512F TUPLE_FULL_32
 EVEX.66.W1.0f5f        RVM  Vpd Hpd Wpd -   EVX_MAXPD+kbe       F=AVX512F TUPLE_FULL_64
 EVEX.F3.W0.LIG.0f5f    RVM  Vdq Hdq Wss -   EVX_MAXSS+ke        F=AVX512F TUPLE1_SCALAR_32
@@ -1766,16 +1868,16 @@ EVEX.F2.W0.0f6f        RM   Vx  Wx  -   -   EVX_MOVDQU8+k       F=AVX512BW TUPLE
 EVEX.F2.W1.0f6f        RM   Vx  Wx  -   -   EVX_MOVDQU16+k      F=AVX512BW TUPLE_FULL_MEM
 EVEX.F2.W0.0f7f        MR   Wx  Vx  -   -   EVX_MOVDQU8+k       F=AVX512BW TUPLE_FULL_MEM
 EVEX.F2.W1.0f7f        MR   Wx  Vx  -   -   EVX_MOVDQU16+k      F=AVX512BW TUPLE_FULL_MEM
-EVEX.NP.W0.L0.0f12/m   RVM  Vps Hps Mq  -   EVX_MOVLPS          F=AVX512F TUPLE2_32
-EVEX.NP.W0.L0.0f12/r   RVM  Vps Hps Ups -   EVX_MOVHLPS         F=AVX512F
-EVEX.66.W1.L0.0f12/m   RVM  Vpd Hpd Msd -   EVX_MOVLPD          F=AVX512F TUPLE1_SCALAR_64
+EVEX.NP.W0.L0.0f12/m   RVM  Vdq Hdq Mq  -   EVX_MOVLPS          F=AVX512F TUPLE2_32
+EVEX.NP.W0.L0.0f12/r   RVM  Vdq Hdq Udq -   EVX_MOVHLPS         F=AVX512F
+EVEX.66.W1.L0.0f12/m   RVM  Vdq Hdq Msd -   EVX_MOVLPD          F=AVX512F TUPLE1_SCALAR_64
 EVEX.NP.W0.L0.0f13/m   MR   Mq  Vq  -   -   EVX_MOVLPS          F=AVX512F TUPLE2_32
 EVEX.66.W1.L0.0f13/m   MR   Msd Vsd -   -   EVX_MOVLPD          F=AVX512F TUPLE1_SCALAR_64
-EVEX.NP.W0.L0.0f16/m   RVM  Vps Hq  Mq  -   EVX_MOVHPS          F=AVX512F TUPLE2_32
-EVEX.NP.W0.L0.0f16/r   RVM  Vps Hq  Uq  -   EVX_MOVLHPS         F=AVX512F
-EVEX.66.W1.L0.0f16/m   RVM  Vpd Hsd Msd -   EVX_MOVHPD          F=AVX512F TUPLE1_SCALAR_64
+EVEX.NP.W0.L0.0f16/m   RVM  Vdq Hq  Mq  -   EVX_MOVHPS          F=AVX512F TUPLE2_32
+EVEX.NP.W0.L0.0f16/r   RVM  Vdq Hq  Uq  -   EVX_MOVLHPS         F=AVX512F
+EVEX.66.W1.L0.0f16/m   RVM  Vdq Hsd Msd -   EVX_MOVHPD          F=AVX512F TUPLE1_SCALAR_64
 EVEX.NP.W0.L0.0f17/m   MR   Mq  Vq  -   -   EVX_MOVHPS          F=AVX512F TUPLE2_32
-EVEX.66.W1.L0.0f17/m   MR   Msd Vpd -   -   EVX_MOVHPD          F=AVX512F TUPLE1_SCALAR_64
+EVEX.66.W1.L0.0f17/m   MR   Msd Vsd -   -   EVX_MOVHPD          F=AVX512F TUPLE1_SCALAR_64
 EVEX.66.W0.0f382a/m    RM   Vx  Mx  -   -   EVX_MOVNTDQA        F=AVX512F TUPLE_FULL_MEM
 EVEX.66.W0.0fe7/m      MR   Mx  Vx  -   -   EVX_MOVNTDQ         F=AVX512F TUPLE_FULL_MEM
 EVEX.NP.W0.0f2b/m      MR   Mps Vps -   -   EVX_MOVNTPS         F=AVX512F TUPLE_FULL_MEM
@@ -1834,14 +1936,14 @@ EVEX.66.0f64           RVM  K   Hx  Wx  -   EVX_PCMPGTB+k       F=AVX512F TUPLE_
 EVEX.66.0f65           RVM  K   Hx  Wx  -   EVX_PCMPGTW+k       F=AVX512F TUPLE_FULL_MEM
 EVEX.66.W0.0f66        RVM  K   Hx  Wx  -   EVX_PCMPGTD+kb      F=AVX512F TUPLE_FULL_32
 EVEX.66.W1.0f3837      RVM  K   Hx  Wx  -   EVX_PCMPGTQ+kb      F=AVX512F TUPLE_FULL_64
-EVEX.66.L0.0f3a14/m    MRI  Mb  Vx  Ib  -   EVX_PEXTRB          F=AVX512BW TUPLE1_SCALAR_8
-EVEX.66.L0.0f3a14/r    MRI  Rd  Vx  Ib  -   EVX_PEXTRB          F=AVX512BW
-EVEX.66.L0.0fc5/r      RMI  Gd  Ux  Ib  -   EVX_PEXTRW          F=AVX512BW
-EVEX.66.L0.0f3a15/m    MRI  Mw  Vx  Ib  -   EVX_PEXTRW          F=AVX512BW TUPLE1_SCALAR_16
-EVEX.66.L0.0f3a15/r    MRI  Rd  Vx  Ib  -   EVX_PEXTRW          F=AVX512BW
+EVEX.66.L0.0f3a14/m    MRI  Mb  Vdq Ib  -   EVX_PEXTRB          F=AVX512BW TUPLE1_SCALAR_8
+EVEX.66.L0.0f3a14/r    MRI  Rd  Vdq Ib  -   EVX_PEXTRB          F=AVX512BW
+EVEX.66.L0.0fc5/r      RMI  Gd  Udq Ib  -   EVX_PEXTRW          F=AVX512BW
+EVEX.66.L0.0f3a15/m    MRI  Mw  Vdq Ib  -   EVX_PEXTRW          F=AVX512BW TUPLE1_SCALAR_16
+EVEX.66.L0.0f3a15/r    MRI  Rd  Vdq Ib  -   EVX_PEXTRW          F=AVX512BW
 EVEX.66.L0.0f3a16      MRI  Ey  Vdq Ib  -   EVX_PEXTR           F=AVX512DQ TUPLE1_SCALAR_OPSZ
-EVEX.66.L0.0f3a20      RVMI Vx  Hx  Eb  Ib  EVX_PINSR           F=AVX512BW TUPLE1_SCALAR_8
-EVEX.66.L0.0fc4        RVMI Vx  Hx  Ew  Ib  EVX_PINSR           F=AVX512BW TUPLE1_SCALAR_16
+EVEX.66.L0.0f3a20      RVMI Vdq Hdq Eb  Ib  EVX_PINSR           F=AVX512BW TUPLE1_SCALAR_8
+EVEX.66.L0.0fc4        RVMI Vdq Hdq Ew  Ib  EVX_PINSR           F=AVX512BW TUPLE1_SCALAR_16
 EVEX.66.L0.0f3a22      RVMI Vdq Hdq Ey  Ib  EVX_PINSR           F=AVX512DQ TUPLE1_SCALAR_OPSZ
 EVEX.66.0f3804         RVM  Vx  Hx  Wx  -   EVX_PMADDUBSW+k     F=AVX512BW TUPLE_FULL_MEM
 EVEX.66.0ff5           RVM  Vx  Hx  Wx  -   EVX_PMADDWD+k       F=AVX512BW TUPLE_FULL_MEM
@@ -1906,8 +2008,8 @@ EVEX.66.W1.0fe2        RVM  Vx  Hx  Wdq -   EVX_PSRAQ+k         F=AVX512F TUPLE_
 EVEX.66.0ff1           RVM  Vx  Hx  Wdq -   EVX_PSLLW+k         F=AVX512BW TUPLE_MEM128
 EVEX.66.W0.0ff2        RVM  Vx  Hx  Wdq -   EVX_PSLLD+k         F=AVX512F TUPLE_MEM128
 EVEX.66.W1.0ff3        RVM  Vx  Hx  Wdq -   EVX_PSLLQ+k         F=AVX512F TUPLE_MEM128
-EVEX.66.0f73/3         VMI  Hx  Ux  Ib  -   EVX_PSRLDQ          F=AVX512BW TUPLE_FULL_MEM
-EVEX.66.0f73/7         VMI  Hx  Ux  Ib  -   EVX_PSLLDQ          F=AVX512BW TUPLE_FULL_MEM
+EVEX.66.0f73/3         VMI  Hx  Wx  Ib  -   EVX_PSRLDQ          F=AVX512BW TUPLE_FULL_MEM
+EVEX.66.0f73/7         VMI  Hx  Wx  Ib  -   EVX_PSLLDQ          F=AVX512BW TUPLE_FULL_MEM
 EVEX.66.0ff8           RVM  Vx  Hx  Wx  -   EVX_PSUBB+k         F=AVX512BW TUPLE_FULL_MEM
 EVEX.66.0ff9           RVM  Vx  Hx  Wx  -   EVX_PSUBW+k         F=AVX512BW TUPLE_FULL_MEM
 EVEX.66.W0.0ffa        RVM  Vx  Hx  Wx  -   EVX_PSUBD+kb        F=AVX512F TUPLE_FULL_32
@@ -1949,10 +2051,10 @@ EVEX.66.W1.0f3865      RVM  Vx  Hx  Wx  -   EVX_BLENDMPD+kb     F=AVX512F TUPLE_
 EVEX.66.W0.0f3818      RM   Vx  Wd  -   -   EVX_BROADCASTSS+k   F=AVX512F TUPLE1_SCALAR_32
 EVEX.66.W0.L12.0f3819  RM   Vx  Wq  -   -   EVX_BROADCASTF32X2+k F=AVX512DQ TUPLE2_32
 EVEX.66.W1.L12.0f3819  RM   Vx  Wq  -   -   EVX_BROADCASTSD+k   F=AVX512F TUPLE1_SCALAR_64
-EVEX.66.W0.L12.0f381a/m RM   Vx  Wdq -   -   EVX_BROADCASTF32X4+k F=AVX512F TUPLE4_32
-EVEX.66.W1.L12.0f381a/m RM   Vx  Wdq -   -   EVX_BROADCASTF64X2+k F=AVX512DQ TUPLE2_64
-EVEX.66.W0.L2.0f381b/m RM   Vx  Wqq -   -   EVX_BROADCASTF32X8+k F=AVX512DQ TUPLE8_32
-EVEX.66.W1.L2.0f381b/m RM   Vx  Wqq -   -   EVX_BROADCASTF64X4+k F=AVX512F TUPLE4_64
+EVEX.66.W0.L12.0f381a/m RM   Vx  Mdq -   -   EVX_BROADCASTF32X4+k F=AVX512F TUPLE4_32
+EVEX.66.W1.L12.0f381a/m RM   Vx  Mdq -   -   EVX_BROADCASTF64X2+k F=AVX512DQ TUPLE2_64
+EVEX.66.W0.L2.0f381b/m RM   Vx  Mqq -   -   EVX_BROADCASTF32X8+k F=AVX512DQ TUPLE8_32
+EVEX.66.W1.L2.0f381b/m RM   Vx  Mqq -   -   EVX_BROADCASTF64X4+k F=AVX512F TUPLE4_64
 # Note tuple type, scale is not memory size but element size
 EVEX.66.W0.0f388a/m    MR   Md  Vx  -   -   EVX_COMPRESSPS+k    F=AVX512F TUPLE1_SCALAR_32
 EVEX.66.W0.0f388a/r    MR   Ux  Vx  -   -   EVX_COMPRESSPS+k    F=AVX512F
@@ -2108,10 +2210,10 @@ EVEX.66.W0.0f3879      RM   Vx  Ww  -   -   EVX_PBROADCASTW+k   F=AVX512BW TUPLE
 EVEX.66.W0.0f3858      RM   Vx  Wd  -   -   EVX_PBROADCASTD+k   F=AVX512F TUPLE1_SCALAR_32
 EVEX.66.W1.0f3859      RM   Vx  Wq  -   -   EVX_PBROADCASTQ+k   F=AVX512F TUPLE1_SCALAR_64
 EVEX.66.W0.0f3859      RM   Vx  Wq  -   -   EVX_BROADCASTI32X2+k F=AVX512DQ TUPLE2_32
-EVEX.66.W0.L12.0f385a/m RM   Vx  Wdq -   -   EVX_BROADCASTI32X4+k F=AVX512DQ TUPLE4_32
-EVEX.66.W1.L12.0f385a/m RM   Vx  Wdq -   -   EVX_BROADCASTI64X2+k F=AVX512DQ TUPLE2_64
-EVEX.66.W0.L2.0f385b/m RM   Vx  Wqq -   -   EVX_BROADCASTI32X8+k F=AVX512DQ TUPLE8_32
-EVEX.66.W1.L2.0f385b/m RM   Vx  Wqq -   -   EVX_BROADCASTI64X4+k F=AVX512F TUPLE4_64
+EVEX.66.W0.L12.0f385a/m RM   Vx  Mdq -   -   EVX_BROADCASTI32X4+k F=AVX512DQ TUPLE4_32
+EVEX.66.W1.L12.0f385a/m RM   Vx  Mdq -   -   EVX_BROADCASTI64X2+k F=AVX512DQ TUPLE2_64
+EVEX.66.W0.L2.0f385b/m RM   Vx  Mqq -   -   EVX_BROADCASTI32X8+k F=AVX512DQ TUPLE8_32
+EVEX.66.W1.L2.0f385b/m RM   Vx  Mqq -   -   EVX_BROADCASTI64X4+k F=AVX512F TUPLE4_64
 EVEX.F3.W1.0f382a/r    RM   Vx  K   -   -   EVX_PBROADCASTMB2Q  F=AVX512CD
 EVEX.F3.W0.0f383a/r    RM   Vx  K   -   -   EVX_PBROADCASTMW2D  F=AVX512CD
 EVEX.66.W0.0f3a1e      RVMI K   Hx  Wx  Ib  EVX_PCMPUD+kb       F=AVX512F TUPLE_FULL_32
